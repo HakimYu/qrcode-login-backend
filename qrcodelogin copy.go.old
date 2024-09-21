@@ -1,0 +1,175 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"github.com/bwmarrin/snowflake"
+	"github.com/gin-gonic/gin"
+	qrcode "github.com/skip2/go-qrcode"
+	"log"
+	"net/http"
+	"os"
+	"time"
+)
+
+const expire_time = 60
+
+// 定义一个结构体来表示数据模型
+type UUIDItem struct {
+	UUID       string `json:"uuid"`
+	IP         string `json:"ip"`
+	UserID     string `json:"user_id"`
+	ExpireTime int64  `json:"expire_time"`
+}
+
+// 创建一个全局的切片来存储数据
+var items = []UUIDItem{}
+
+func readItemsFromFile() {
+	data, err := os.ReadFile("UUID.json")
+	if err != nil {
+		log.Println("Failed to open file: UUID.json", err)
+	}
+	err = json.Unmarshal(data, &items)
+	if err != nil {
+		log.Println("Failed to unmarshal JSON: UUID.json", err)
+	}
+}
+
+func searchUUID(uuid string) (UUIDItem, error) {
+	readItemsFromFile()
+	for _, item := range items {
+		if item.UUID == uuid {
+			return item, nil
+		}
+	}
+	err := fmt.Errorf("UUID not found")
+	return UUIDItem{}, err
+}
+
+func saveItemsToFile() {
+	data, err := json.MarshalIndent(items, "", "  ")
+	if err != nil {
+		log.Println("Failed to marshal JSON", err)
+	}
+	err = os.WriteFile("UUID.json", data, 0644)
+	if err != nil {
+		log.Println("Failed to write file: UUID.json", err)
+	}
+}
+
+func delItemInItem(uuid string) {
+	for index, item := range items {
+		if item.UUID == uuid {
+			items = append(items[:index], items[index+1:]...)
+			break
+		}
+	}
+}
+
+// 处理获取二维码的请求
+func getCodeImg(c *gin.Context) []byte {
+	readItemsFromFile()
+	for _, item := range items {
+		if (time.Now().Unix()-item.ExpireTime > expire_time) {
+			fmt.Printf("Found expired uuid: %s, delete it\n", item.UUID)
+			delItemInItem(item.UUID)
+		}
+	}
+	saveItemsToFile()
+	readItemsFromFile()
+	uuid := generateUUID()
+	// 生成一个新的UUID
+	item := UUIDItem{
+		UUID:       uuid,
+		IP:         c.ClientIP(),
+		ExpireTime: time.Now().Unix(),
+	}
+	items = append(items, item)
+	saveItemsToFile()
+	// 生成二维码
+	codeImg, _ := qrcode.Encode(uuid, qrcode.Medium, 256)
+	// 返回图片数据
+	return codeImg
+}
+
+func generateUUID() string {
+	readItemsFromFile()
+	// 创建一个新的snowflake ID生成器
+	node, _ := snowflake.NewNode(1)
+	// 生成并返回一个新的UUID
+	return node.Generate().String()
+}
+
+type response struct {
+	Success bool   `json:"success"`
+	UserID  string `json:"user_id"`
+	Message string `json:"message"`
+}
+
+// 检查UUID是否已确认登录(轮训)
+func checkUUID(uuid string) (response, error) {
+	item, err := searchUUID(uuid)
+	if err != nil {
+		return response{
+			Success: true,
+			UserID:  uuid,
+			Message: "UUID not found",
+		}, err
+	} else {
+		if time.Now().Unix()-item.ExpireTime > 60 {
+			delItemInItem(uuid)
+			return response{
+				Success: false,
+				UserID:  uuid,
+				Message: "expired",
+			}, nil
+		}
+		return response{
+			Success: true,
+			UserID:  item.UserID,
+			Message: "success",
+		}, nil
+	}
+}
+
+func main() {
+	r := gin.Default()
+	fmt.Print("Hello, World!")
+	// 获取二维码
+	r.GET("/getqrcode", func(c *gin.Context) {
+		c.Header("Content-Type", "image/png")
+		// 返回图片数据
+		c.Data(http.StatusOK, "image/png", getCodeImg(c))
+	})
+
+	// 检查UUID是否已登录
+	r.POST("/checkuuid", func(c *gin.Context) {
+		rawData, err := c.GetRawData()
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "Invalid request",
+			})
+			return
+		}
+		bodyString := string(rawData)
+		res, err := checkUUID(bodyString)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		} else {
+			c.JSON(http.StatusOK, gin.H{
+				"success": res.Success,
+				"user_id": res.UserID,
+				"message": res.Message,
+			})
+			delItemInItem(bodyString)
+		}
+	})
+
+	r.Run(":8080")
+}
