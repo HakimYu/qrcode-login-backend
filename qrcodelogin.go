@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -22,8 +23,8 @@ var mu sync.Mutex
 // 过期时间(单位：秒)
 const expire_time = 6000
 
-// 填写本机IP地址
-const local_ip = "192.168.100.100"
+// 填写前端域名(IP+端口)
+const domain = "192.168.100.100:3000"
 
 // 定义一个结构体来表示数据模型
 type UUIDItem struct {
@@ -151,7 +152,12 @@ func (m *UUIDManager) getCodeImg(c *gin.Context) ([]byte, string) {
 	mu.Lock()
 	m.saveItemsToFile()
 	mu.Unlock()
-	codeImg, _ := qrcode.Encode("http://"+local_ip+":3000/phone?uuid="+uuid+"&ip="+c.ClientIP(), qrcode.Medium, 256)
+	baseURL := fmt.Sprintf("http://%s/phone", domain)
+	params := url.Values{}
+	params.Add("uuid", uuid)
+	params.Add("ip", c.ClientIP())
+	fullURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
+	codeImg, _ := qrcode.Encode(fullURL, qrcode.Medium, 256)
 	return codeImg, uuid
 }
 
@@ -322,5 +328,5 @@ func main() {
 
 		c.JSON(http.StatusOK, res)
 	})
-	r.Run("0.0.0.0:8080")
+	r.Run("0.0.0.0:8099")
 }
