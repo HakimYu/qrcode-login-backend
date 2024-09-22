@@ -16,19 +16,24 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 )
 
+// 进程锁
 var mu sync.Mutex
 
-const expire_time = 10
+// 过期时间(单位：秒)
+const expire_time = 6000
+
+// 填写本机IP地址
 const local_ip = "192.168.100.100"
 
 // 定义一个结构体来表示数据模型
 type UUIDItem struct {
-	UUID       string `json:"uuid"`
-	IP         string `json:"ip"`
-	UserID     string `json:"user_id"`
-	ExpireTime int64  `json:"expire_time"`
+	UUID         string `json:"uuid"`
+	IP           string `json:"ip"`
+	UserID       string `json:"user_id"`
+	GenerateTime int64  `json:"generate_time"`
 }
 
+// 获取本地 IP(供使用者查看)
 func GetLocalIP() ([]string, error) {
 	var localIPs []string
 
@@ -125,7 +130,7 @@ func (m *UUIDManager) getCodeImg(c *gin.Context) ([]byte, string) {
 	m.readItemsFromFile()
 	var toDelete []string
 	for _, item := range m.items {
-		if time.Now().Unix()-item.ExpireTime > expire_time {
+		if time.Now().Unix()-item.GenerateTime > expire_time {
 			fmt.Printf("Found expired uuid: %s, delete it\n", item.UUID)
 			toDelete = append(toDelete, item.UUID)
 		}
@@ -137,16 +142,16 @@ func (m *UUIDManager) getCodeImg(c *gin.Context) ([]byte, string) {
 	mu.Unlock()
 	uuid := m.generateUUID()
 	item := UUIDItem{
-		UUID:       uuid,
-		IP:         c.ClientIP(),
-		UserID:     "",
-		ExpireTime: time.Now().Unix(),
+		UUID:         uuid,
+		IP:           c.ClientIP(),
+		UserID:       "",
+		GenerateTime: time.Now().Unix(),
 	}
 	m.items = append(m.items, item)
 	mu.Lock()
 	m.saveItemsToFile()
 	mu.Unlock()
-	codeImg, _ := qrcode.Encode("http://"+local_ip+":3000/phone?uuid="+uuid, qrcode.Medium, 256)
+	codeImg, _ := qrcode.Encode("http://"+local_ip+":3000/phone?uuid="+uuid+"&ip="+c.ClientIP(), qrcode.Medium, 256)
 	return codeImg, uuid
 }
 
@@ -156,42 +161,76 @@ func (m *UUIDManager) generateUUID() string {
 	return node.Generate().String()
 }
 
+type checkResponse struct {
+	Success bool   `json:"success"`
+	UserID  string `json:"user_id"`
+	Message string `json:"message"`
+}
+
 // 检查 UUID
-func (m *UUIDManager) checkUUID(uuid string) (response, error) {
+func (m *UUIDManager) checkUUID(uuid string) (checkResponse, error) {
+
+	m.readItemsFromFile()
 	item, err := m.searchUUID(uuid)
+	fmt.Printf("item: %v\n", item)
 	if err != nil {
-		return response{
+		return checkResponse{
 			Success: false,
-			UserID:  uuid,
+			UserID:  "",
 			Message: "notfound",
 		}, err
 	}
-	if time.Now().Unix()-item.ExpireTime > expire_time {
+	if time.Now().Unix()-item.GenerateTime > expire_time {
 		m.delItemInItem(uuid)
-		return response{
+		return checkResponse{
 			Success: false,
-			UserID:  uuid,
+			UserID:  "",
 			Message: "expired",
 		}, nil
 	}
 	if item.UserID == "" {
-		return response{
+		return checkResponse{
 			Success: false,
-			UserID:  uuid,
+			UserID:  item.UserID,
 			Message: "notyet",
 		}, nil
 	}
-	return response{
+	fmt.Printf("success")
+	m.delItemInItem(uuid)
+	return checkResponse{
 		Success: true,
 		UserID:  item.UserID,
 		Message: "success",
 	}, nil
 }
 
-type response struct {
+type loginResponse struct {
 	Success bool   `json:"success"`
-	UserID  string `json:"user_id"`
 	Message string `json:"message"`
+}
+
+func (m *UUIDManager) login(uuid string, user_id string) (loginResponse, error) {
+	mu.Lock()
+	m.readItemsFromFile()
+	mu.Unlock()
+	for index, item := range m.items {
+		if item.UUID == uuid {
+			fmt.Printf("found uuid: %s, user_id: %s\n", item.UUID, item.UserID)
+			fmt.Printf("user_id: %s\n", user_id)
+			m.items[index].UserID = user_id
+			mu.Lock()
+			m.saveItemsToFile()
+			mu.Unlock()
+			return loginResponse{
+				Success: true,
+				Message: "success",
+			}, nil
+		}
+	}
+	return loginResponse{
+		Success: false,
+		Message: "notfound",
+	}, fmt.Errorf("UUID not found")
 }
 
 func main() {
@@ -227,7 +266,7 @@ func main() {
 			UUID string `json:"uuid"`
 		}
 
-		// 解析请求体
+		// 请求错误
 		if err := c.ShouldBindJSON(&reqBody); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"success": false,
@@ -238,23 +277,23 @@ func main() {
 
 		// 检查 UUID
 		res, err := manager.checkUUID(reqBody.UUID)
+		//检查出错
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
+			c.JSON(http.StatusOK, gin.H{
 				"success": false,
-				"message": err.Error(),
+				"message": res.Message,
 			})
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
-			"success": res.Success,
-			"user_id": res.UserID,
-			"message": res.Message,
-		})
+		c.JSON(http.StatusOK, res)
 
 		// 删除 UUID
 		if res.Success {
 			manager.delItemInItem(reqBody.UUID)
+			mu.Lock()
+			manager.saveItemsToFile()
+			mu.Unlock()
 		}
 	})
 	r.POST("/login", func(c *gin.Context) {
@@ -271,9 +310,8 @@ func main() {
 			})
 			return
 		}
-
 		// 检查 UUID
-		res, err := manager.checkUUID(reqBody.UUID)
+		res, err := manager.login(reqBody.UUID, reqBody.UserID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"success": false,
@@ -282,24 +320,7 @@ func main() {
 			return
 		}
 
-		// 保存用户 ID
-		if res.Success {
-			for itemIndex, item := range manager.items {
-				if item.UUID == reqBody.UUID {
-					manager.items[itemIndex].UserID = reqBody.UserID
-					break
-				}
-			}
-			mu.Lock()
-			manager.saveItemsToFile()
-			mu.Unlock()
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"success": res.Success,
-			"user_id": res.UserID,
-			"message": res.Message,
-		})
+		c.JSON(http.StatusOK, res)
 	})
 	r.Run("0.0.0.0:8080")
 }
